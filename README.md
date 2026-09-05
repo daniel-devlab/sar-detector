@@ -32,7 +32,9 @@ Built on the same stack as the rest of this portfolio — `ultralytics` YOLO
 - **Pixel-to-ground pinning** (`geo.py`): when telemetry is available, a
   confirmed track's pixel location is raycast onto the ground to produce a
   lat/lon with an honest error radius, turning a box into a map pin instead
-  of just a frame coordinate.
+  of just a frame coordinate. A box in a video frame tells a reviewer
+  something was seen; a lat/lon is what a ground team can actually walk to,
+  so this closes the gap between "detected" and "actionable."
 
 ## Why this approach exists
 
@@ -223,6 +225,13 @@ New CSV columns are appended only when a pin can be computed:
 - `lat`, `lon`
 - `agl_m`, `gsd_cm`
 - `err_radius_m`
+
+Telemetry is entirely optional and nothing else in the pipeline depends on
+it: without `--telemetry`, every confirmed track still gets a box, a
+snapshot, and a CSV row exactly as before — the new `lat`/`lon`/`agl_m`/
+`gsd_cm`/`err_radius_m` columns are simply left blank, and no `.geojson` or
+`.gpx` files are written. There is no live GPS feed requirement to run this
+tool at all.
 
 ## Improving accuracy: fine-tune on aerial data
 
