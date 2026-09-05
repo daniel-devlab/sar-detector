@@ -5,16 +5,138 @@ drone video, tracks them across frames so the same person isn't
 double-counted, and keeps an "intel log" of every new person spotted
 (timestamp, location in frame, and a saved snapshot crop).
 
+This repo started with the standard small-object playbook: slice the frame,
+run YOLO on each tile, then track detections over time. That works for many
+aerial videos, but it breaks down once the drone climbs high enough that a
+person is only a handful of pixels. The current pipeline exists because the
+failure mode was not really "the tile size is wrong"; it was "the subject is
+below the representation the detector was trained to see." The fix was to
+stop treating the image as a flat grid and instead behave more like a SAR
+operator: scan wide, zoom only where something lives, then confirm that it
+persists.
+
 Built on the same stack as the rest of this portfolio — `ultralytics` YOLO
-+ `supervision` — plus two pieces that are new to this project:
++ `supervision` — plus three pieces that are new to this project:
 
 - **Tiled inference** (`sv.InferenceSlicer`): drone footage is high
   resolution with tiny subjects; running YOLO on the whole frame at once
   would downscale people to almost nothing. The slicer runs the model on
   overlapping tiles instead and merges the results.
+- **Scout → zoom inference** (`scout_zoom.py`): a cheap motion pass finds a
+  handful of candidate ROIs, those chips are explicitly upsampled before
+  YOLO sees them, and the pipeline falls back to tiled full-frame inference
+  on a fixed interval as a safety net.
 - **Multi-object tracking** (`ByteTrackTracker`, from the `trackers`
   package): assigns a stable ID to each person across frames, so "new
   person spotted" fires once per person, not once per frame.
+
+## Why this approach exists
+
+At high elevation, a person is often only 4 to 15 pixels tall in the full
+frame. That creates a different problem than ordinary object detection:
+
+- A 160 to 320 pixel tile can still contain a person that occupies roughly 1%
+  of the tile.
+- The smallest standard YOLO feature head is not built for reliably
+  representing 4-pixel blobs after repeated downsampling.
+- Most of a 4K search frame is empty terrain, so uniform tiling spends most of
+  its budget on negative space.
+- A raw crop around an 8-pixel detection is usually not useful for a human
+  reviewer either.
+
+That is why the pipeline now combines motion scouting, explicit zoom on
+candidate chips, and stricter temporal confirmation. Each stage solves a
+different part of the high-altitude problem:
+
+- Scout reduces the amount of terrain that needs expensive inference.
+- Zoom makes tiny people larger before YOLO sees them.
+- Track confirmation keeps single-frame speckles from being logged as real
+  sightings.
+
+## Scout -> Zoom -> Confirm
+
+The live detection loop now follows this pattern:
+
+```text
+full frame
+   |
+   v
+1. SCOUT   frame differencing finds compact moving ROIs
+   |
+   v
+2. ZOOM    each ROI is padded, cropped, and upsampled before YOLO inference
+   |
+   v
+3. CONFIRM detections are merged back into full-frame coordinates
+   |
+   v
+4. TRACK   ByteTrack keeps only persistent targets as stable IDs
+```
+
+In code, that means:
+
+- `scout_zoom.py` runs a cheap grayscale `absdiff` against the previous frame,
+  thresholds the residual, dilates it, and converts compact blobs into ROIs.
+- Each ROI is padded and resized with cubic interpolation before it reaches
+  YOLO, so a tiny target gets more usable pixels.
+- The fallback slicer still runs periodically, which keeps the system from
+  becoming blind to static or slow targets that motion scouting may miss.
+- `ByteTrackTracker` only promotes detections that survive for multiple frames,
+  so the intel log reflects persistent tracks rather than one-frame noise.
+
+## Methodology
+
+The method came from observing what was failing in zoomed-out aerial footage.
+Uniform tiling was already the correct class of solution for ordinary small
+objects, but the misses at high elevation showed that the bottleneck was not
+only spatial coverage. It was scale, sparsity, and temporal ambiguity:
+
+- Scale: a person was too small in the original frame for a stock detector to
+  describe well.
+- Sparsity: most tiles were empty, so compute was being spent on terrain rather
+  than the few places that mattered.
+- Temporal ambiguity: one weak box in one frame was not enough to call a real
+  sighting.
+
+That led directly to the current design:
+
+- use motion as a cheap prior for where to spend inference
+- use digital zoom only on those candidate regions
+- require persistence over time before declaring a new target
+
+This is also closer to how a human search operator works in practice: scan the
+scene broadly, zoom into suspicious movement, and only trust a target after it
+stays consistent across multiple frames.
+
+## Altitude-aware sizing
+
+If the drone altitude and camera field of view are known, you can estimate how
+tall a standing person appears in pixels:
+
+$$
+p_{x} \approx \frac{1.7 \cdot H_{img}}{2 \cdot h \cdot \tan(\mathrm{fov}/2)}
+$$
+
+Where:
+
+- `1.7` is an approximate person height in meters
+- `H_img` is the image height in pixels
+- `h` is the drone altitude above ground in meters
+- `fov` is the vertical field of view in radians
+
+This matters because the inference mode should change with expected target
+size:
+
+| Person size in frame | Recommended strategy |
+| --- | --- |
+| `> 40 px` | Full frame or large tiles; no extra zoom needed |
+| `15-40 px` | Moderate tiling and mild upsample |
+| `5-15 px` | Scout plus 2x to 4x zoom chips |
+| `< 5 px` | Lean on motion and persistence; single-frame boxes are unreliable |
+
+The CLI defaults are conservative, but for high-elevation footage the useful
+controls are usually `--zoom-factor`, `--imgsz`, `--slice-wh`,
+`--scout-min-area`, and `--scout-max-area`.
 
 ## Example
 
@@ -53,6 +175,17 @@ uv pip install -r requirements.txt
 python main.py --source drone_video.mp4 --output annotated.mp4 --classes person
 ```
 
+For zoomed-out live or high-altitude footage, the default path is now the
+scout pipeline. Disable it with `--no-scout` if you want the older
+"slice every frame" behavior.
+
+For the current high-elevation test video in this repo, a practical starting
+command is:
+
+```powershell
+python main.py --source drone_video.mp4 --classes person --confidence 0.15 --zoom-factor 3 --imgsz 1280 --slice-wh 320 --overlap-wh 60 --stride 15
+```
+
 Outputs:
 - `annotated.mp4` — the video with green boxes, track IDs, and a running
   "in view / total found" counter drawn on it.
@@ -77,6 +210,12 @@ python main.py --source drone_video.mp4 --model best.pt --classes person
 | --- | --- | --- |
 | `--slice-wh` | 640 | Tile size for `InferenceSlicer`. Smaller tiles help with more distant/smaller people, at the cost of more inference calls per frame. |
 | `--overlap-wh` | 100 | Overlap between tiles, so a person straddling a tile boundary is still detected whole in the neighboring tile. |
+| `--zoom-factor` | 3.0 | Explicit cubic upsample factor applied before YOLO sees a tile or motion ROI. |
+| `--imgsz` | 640 | YOLO input size. Raising this to `1280` helps if the model was trained for higher-resolution inference. |
+| `--scout` | on | Uses frame differencing to find likely ROIs and only zoom-infers on those chips, with a periodic full sliced pass as a safety net. |
+| `--scout-min-area` / `--scout-max-area` | 8 / 900 | Pixel-area band for motion blobs worth zooming into. This is the main knob for matching the scout stage to expected person size at a given altitude. |
+| `--scout-fallback-interval` | 30 | Forces an occasional full sliced pass so static or low-motion targets are not ignored forever. |
+| `--tracker-min-frames` | 3 | Minimum persistence before a target is logged as a real sighting. |
 | `--stride` | 1 | Process every Nth frame. Raise this (e.g. `15`-`60`) on CPU to keep up with long or high-resolution footage — the tracker's `timestamp` handling keeps counts and timing correct even when frames are skipped. |
 | `--confidence` | 0.25 | Minimum detection confidence. |
 | `--device` | cpu | `cuda` or `cuda:0` if you have a GPU available locally (check with `nvidia-smi`). |
@@ -93,12 +232,14 @@ handful of pixels, well below what a stock detector can recognize.
 Fixes, cheapest first:
 - Lower `--confidence` (e.g. `0.1`) — costs nothing extra, sometimes enough
   on its own.
-- Shrink `--slice-wh` (try `320`, then `160`) — each tile gets upscaled to
-  the model's input size, so a tiny person occupies far more of what the
-  model actually sees. This is slower: smaller tiles mean more inference
-  calls per frame.
+- Shrink `--slice-wh` (try `320`, then `160`) or raise `--zoom-factor` — each
+  tile or ROI then occupies far more of what the model actually sees. This is
+  slower: smaller tiles mean more inference calls per frame, and larger zoom
+  factors make each inference heavier.
 - Always pair a small `--slice-wh` with `--stride 15` or higher on CPU —
   otherwise a single 4K video can take well over an hour to process.
+- Tune `--scout-min-area` and `--scout-max-area` if the motion scout is either
+  missing tiny walkers or firing on broad terrain shimmer.
 - Expect some false positives (tree canopy, rooftop clutter) once tiles get
   small — a stock model wasn't trained on this viewpoint. That gap is
   exactly what `train_colab.py`'s fine-tuning step is for.
@@ -107,7 +248,8 @@ Fixes, cheapest first:
 
 `ByteTrackTracker` gives every detection a `tracker_id`. A brand new track
 starts at `tracker_id == -1` ("unconfirmed") and only gets a real ID once it
-has matched for `minimum_consecutive_frames` (default 2) in a row — this
-avoids treating single-frame false positives as sightings. `main.py` only
-logs and draws confirmed tracks, and logs each one exactly once, the first
-frame it becomes confirmed.
+has matched for `minimum_consecutive_frames` in a row. The default is now `3`,
+which is slightly stricter than the old behavior and better aligned with the
+idea that tiny high-altitude detections should survive more than one match
+before they become an intel event. `main.py` only logs and draws confirmed
+tracks, and logs each one exactly once, the first frame it becomes confirmed.

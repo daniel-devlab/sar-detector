@@ -35,6 +35,7 @@ import cv2
 import numpy as np
 from detector_utils import filter_by_class_names, find_new_confirmed_track_ids
 from intel_log import IntelLog
+from scout_zoom import detect_with_scout
 from trackers import ByteTrackTracker
 from ultralytics import YOLO
 
@@ -42,7 +43,12 @@ import supervision as sv
 
 
 def make_callback(
-    model: YOLO, confidence: float, device: str, class_names: list[str]
+    model: YOLO,
+    confidence: float,
+    device: str,
+    class_names: list[str],
+    imgsz: int,
+    zoom_factor: float,
 ) -> Callable[[np.ndarray], sv.Detections]:
     """Build the per-tile inference callback `InferenceSlicer` will call.
 
@@ -55,9 +61,27 @@ def make_callback(
     """
 
     def callback(image_slice: np.ndarray) -> sv.Detections:
-        result = model(image_slice, conf=confidence, device=device, verbose=False)[0]
+        model_input = image_slice
+        if zoom_factor != 1.0:
+            model_input = cv2.resize(
+                image_slice,
+                None,
+                fx=zoom_factor,
+                fy=zoom_factor,
+                interpolation=cv2.INTER_CUBIC,
+            )
+        result = model(
+            model_input,
+            conf=confidence,
+            device=device,
+            imgsz=imgsz,
+            verbose=False,
+        )[0]
         detections = sv.Detections.from_ultralytics(result)
-        return filter_by_class_names(detections, model.names, class_names)
+        detections = filter_by_class_names(detections, model.names, class_names)
+        if zoom_factor != 1.0 and len(detections) > 0:
+            detections.xyxy = detections.xyxy / zoom_factor
+        return detections
 
     return callback
 
@@ -65,7 +89,7 @@ def make_callback(
 def draw_overlay(frame: np.ndarray, in_view: int, total_found: int) -> np.ndarray:
     """Draw the running "in view / total found" counters in the corner."""
     text = f"In view: {in_view}   Total found: {total_found}"
-    cv2.rectangle(frame, (0, 0), (min(frame.shape[1], 420), 40), (0, 0, 0), -1)
+    cv2.rectangle(frame, (0, 0), (min(frame.shape[1], 500), 76), (0, 0, 0), -1)
     cv2.putText(
         frame,
         text,
@@ -80,14 +104,40 @@ def draw_overlay(frame: np.ndarray, in_view: int, total_found: int) -> np.ndarra
 
 
 def save_snapshot(
-    frame: np.ndarray, xyxy: np.ndarray, snapshot_dir: Path, track_id: int
+    frame: np.ndarray,
+    xyxy: np.ndarray,
+    snapshot_dir: Path,
+    track_id: int,
+    context_scale: float,
+    upscale_factor: float,
 ) -> str:
-    """Crop `xyxy` out of `frame` and save it under `snapshot_dir`."""
-    x_min, y_min, x_max, y_max = (max(0, int(v)) for v in xyxy)
-    crop = frame[y_min:y_max, x_min:x_max]
+    """Save a padded, upsampled crop around `xyxy` for later review."""
+    frame_h, frame_w = frame.shape[:2]
+    x_min, y_min, x_max, y_max = (int(v) for v in xyxy)
+    box_w = max(1, x_max - x_min)
+    box_h = max(1, y_max - y_min)
+    side = int(max(box_w, box_h) * context_scale)
+    cx = (x_min + x_max) // 2
+    cy = (y_min + y_max) // 2
+    half_side = max(1, side // 2)
+
+    crop_x_min = max(0, cx - half_side)
+    crop_y_min = max(0, cy - half_side)
+    crop_x_max = min(frame_w, cx + half_side)
+    crop_y_max = min(frame_h, cy + half_side)
+    crop = frame[crop_y_min:crop_y_max, crop_x_min:crop_x_max]
+
     snapshot_dir.mkdir(parents=True, exist_ok=True)
     path = snapshot_dir / f"person_{track_id:04d}.jpg"
     if crop.size > 0:
+        if upscale_factor != 1.0:
+            crop = cv2.resize(
+                crop,
+                None,
+                fx=upscale_factor,
+                fy=upscale_factor,
+                interpolation=cv2.INTER_CUBIC,
+            )
         cv2.imwrite(str(path), crop)
         return str(path)
     return ""
@@ -111,6 +161,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--confidence", type=float, default=0.25)
     parser.add_argument("--device", default="cpu", help='"cpu", "cuda", or "cuda:0".')
+    parser.add_argument(
+        "--imgsz",
+        type=int,
+        default=640,
+        help="Model input size passed through to YOLO inference.",
+    )
+    parser.add_argument(
+        "--zoom-factor",
+        type=float,
+        default=3.0,
+        help="Explicit cubic upsample factor applied before YOLO sees a tile or ROI.",
+    )
     parser.add_argument("--slice-wh", type=int, default=640)
     parser.add_argument("--overlap-wh", type=int, default=100)
     parser.add_argument(
@@ -132,7 +194,85 @@ def parse_args() -> argparse.Namespace:
         help="Directory to save a crop of each newly-spotted person.",
     )
     parser.add_argument(
+        "--snapshot-context-scale",
+        type=float,
+        default=8.0,
+        help="How much surrounding context to keep around a tracked box when saving snapshots.",
+    )
+    parser.add_argument(
+        "--snapshot-upscale",
+        type=float,
+        default=4.0,
+        help="Explicit upsample factor applied to saved snapshots.",
+    )
+    parser.add_argument(
         "--intel-csv", default="intel_log.csv", help="Where to write the intel log CSV."
+    )
+    parser.add_argument(
+        "--scout",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use motion-gated scout ROIs before falling back to full sliced inference.",
+    )
+    parser.add_argument(
+        "--scout-min-area",
+        type=int,
+        default=8,
+        help="Minimum motion-blob area in pixels to treat as a scout ROI.",
+    )
+    parser.add_argument(
+        "--scout-max-area",
+        type=int,
+        default=900,
+        help="Maximum motion-blob area in pixels to treat as a scout ROI.",
+    )
+    parser.add_argument(
+        "--scout-threshold",
+        type=int,
+        default=12,
+        help="Binary threshold applied to frame differencing during the scout pass.",
+    )
+    parser.add_argument(
+        "--scout-pad-ratio",
+        type=float,
+        default=1.8,
+        help="How much padding to add around each scout ROI before zoomed inference.",
+    )
+    parser.add_argument(
+        "--scout-max-rois",
+        type=int,
+        default=24,
+        help="Fall back to full sliced inference when motion produces more than this many ROIs.",
+    )
+    parser.add_argument(
+        "--scout-fallback-interval",
+        type=int,
+        default=30,
+        help="Run one full sliced pass every N processed frames as a safety net; 0 disables it.",
+    )
+    parser.add_argument(
+        "--tracker-min-frames",
+        type=int,
+        default=3,
+        help="Frames a track must survive before it is treated as confirmed.",
+    )
+    parser.add_argument(
+        "--tracker-activation-threshold",
+        type=float,
+        default=0.5,
+        help="Minimum detection confidence ByteTrack uses to activate a new track.",
+    )
+    parser.add_argument(
+        "--tracker-high-conf-threshold",
+        type=float,
+        default=0.5,
+        help="High-confidence threshold ByteTrack uses during matching.",
+    )
+    parser.add_argument(
+        "--tracker-min-iou",
+        type=float,
+        default=0.05,
+        help="Minimum IoU ByteTrack uses when associating tiny detections across frames.",
     )
     return parser.parse_args()
 
@@ -148,6 +288,8 @@ def main() -> None:
         confidence=args.confidence,
         device=args.device,
         class_names=class_names,
+        imgsz=args.imgsz,
+        zoom_factor=args.zoom_factor,
     )
     slicer = sv.InferenceSlicer(
         callback=callback,
@@ -157,14 +299,18 @@ def main() -> None:
     )
 
     video_info = sv.VideoInfo.from_video_path(args.source)
-    tracker = ByteTrackTracker(frame_rate=video_info.fps or 30.0)
+    tracker = ByteTrackTracker(
+        frame_rate=video_info.fps or 30.0,
+        track_activation_threshold=args.tracker_activation_threshold,
+        minimum_consecutive_frames=args.tracker_min_frames,
+        minimum_iou_threshold=args.tracker_min_iou,
+        high_conf_det_threshold=args.tracker_high_conf_threshold,
+    )
 
     # A fixed green box (rather than the default per-track color palette)
     # keeps every detection visually consistent -- "green box = person found".
     box_annotator = sv.BoxAnnotator(color=sv.Color.GREEN, thickness=3)
-    label_annotator = sv.LabelAnnotator(
-        color=sv.Color.GREEN, text_color=sv.Color.BLACK
-    )
+    label_annotator = sv.LabelAnnotator(color=sv.Color.GREEN, text_color=sv.Color.BLACK)
     trace_annotator = sv.TraceAnnotator(color=sv.Color.GREEN)
 
     intel_log = IntelLog()
@@ -173,8 +319,11 @@ def main() -> None:
 
     fps = video_info.fps or 30.0
     frame_source = sv.get_video_frames_generator(args.source, stride=args.stride)
+    prev_gray: np.ndarray | None = None
 
-    print(f"Processing {args.source} ({video_info.width}x{video_info.height} @ {fps:.1f}fps)")
+    print(
+        f"Processing {args.source} ({video_info.width}x{video_info.height} @ {fps:.1f}fps)"
+    )
     start_time = time.monotonic()
 
     try:
@@ -182,7 +331,31 @@ def main() -> None:
             for frame_index, frame in enumerate(frame_source):
                 timestamp_sec = (frame_index * args.stride) / fps
 
-                detections = slicer(frame)
+                if args.scout:
+                    detections, prev_gray, roi_count, used_fallback = detect_with_scout(
+                        frame,
+                        prev_gray,
+                        model=model,
+                        class_names=class_names,
+                        confidence=args.confidence,
+                        device=args.device,
+                        imgsz=args.imgsz,
+                        zoom_factor=args.zoom_factor,
+                        fallback_fn=slicer,
+                        frame_index=frame_index,
+                        min_area=args.scout_min_area,
+                        max_area=args.scout_max_area,
+                        threshold=args.scout_threshold,
+                        pad_ratio=args.scout_pad_ratio,
+                        max_rois=args.scout_max_rois,
+                        fallback_interval=args.scout_fallback_interval,
+                        merge_iou_threshold=args.iou_threshold,
+                    )
+                else:
+                    detections = slicer(frame)
+                    roi_count = 0
+                    used_fallback = True
+
                 # `frame=` is intentionally omitted: this tracker ignores it
                 # (no camera-motion compensation) and warns if it's passed.
                 detections = tracker.update(detections, timestamp=timestamp_sec)
@@ -191,7 +364,12 @@ def main() -> None:
                 for track_id in new_ids:
                     row = np.where(detections.tracker_id == track_id)[0][0]
                     snapshot_path = save_snapshot(
-                        frame, detections.xyxy[row], snapshot_dir, track_id
+                        frame,
+                        detections.xyxy[row],
+                        snapshot_dir,
+                        track_id,
+                        context_scale=args.snapshot_context_scale,
+                        upscale_factor=args.snapshot_upscale,
                     )
                     intel_log.record(
                         track_id=track_id,
@@ -216,10 +394,24 @@ def main() -> None:
                 labels = [f"#{tid}" for tid in confirmed.tracker_id]
                 annotated = trace_annotator.annotate(frame.copy(), confirmed)
                 annotated = box_annotator.annotate(annotated, confirmed)
-                annotated = label_annotator.annotate(annotated, confirmed, labels=labels)
+                annotated = label_annotator.annotate(
+                    annotated, confirmed, labels=labels
+                )
                 annotated = draw_overlay(
                     annotated, in_view=len(confirmed), total_found=len(seen_ids)
                 )
+                if args.scout:
+                    mode_text = f"Scout ROIs: {roi_count}   Fallback: {'yes' if used_fallback else 'no'}"
+                    cv2.putText(
+                        annotated,
+                        mode_text,
+                        (10, 62),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (0, 255, 255),
+                        2,
+                        cv2.LINE_AA,
+                    )
 
                 sink.write_frame(annotated)
     except KeyboardInterrupt:
