@@ -1,0 +1,5 @@
+opencv-python
+numpy
+supervision>=0.28.0
+ultralytics
+trackers

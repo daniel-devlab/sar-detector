@@ -1,0 +1,19 @@
+# Virtual environment
+.venv/
+
+# Python
+__pycache__/
+*.pyc
+
+# Model weights (auto-downloaded by ultralytics, or your own fine-tuned checkpoint)
+*.pt
+
+# Video files (source footage and rendered output) -- too large for git,
+# and GitHub hard-rejects anything over 100MB anyway
+*.mp4
+*.avi
+*.mov
+
+# Run outputs
+intel_log.csv
+snapshots/
