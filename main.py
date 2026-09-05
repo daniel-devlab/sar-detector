@@ -330,8 +330,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--tracker-activation-threshold",
         type=float,
-        default=0.5,
-        help="Minimum detection confidence ByteTrack uses to activate a new track.",
+        default=None,
+        help="Minimum detection confidence ByteTrack uses to activate a new track. "
+        "Defaults to max(0.15, --confidence + 0.05) so it never silently sits "
+        "above --confidence and blocks every track from activating.",
     )
     parser.add_argument(
         "--tracker-high-conf-threshold",
@@ -353,6 +355,8 @@ def main() -> None:
     class_names = [c.strip() for c in args.classes.split(",") if c.strip()]
     telemetry = load_telemetry(args.telemetry, args.hfov)
     telemetry_index = 0
+    if args.tracker_activation_threshold is None:
+        args.tracker_activation_threshold = max(0.15, args.confidence + 0.05)
 
     print(f"Loading model: {args.model}")
     model = YOLO(args.model)
@@ -394,6 +398,19 @@ def main() -> None:
     frame_source = sv.get_video_frames_generator(args.source, stride=args.stride)
     prev_gray: np.ndarray | None = None
 
+    # The frame generator only yields every `stride`-th frame, so the sink
+    # must be written at fps/stride or the output plays back sped up.
+    sink_fps = max(1.0, fps / max(args.stride, 1))
+    total_frames = getattr(video_info, "total_frames", None)
+    sink_video_info = sv.VideoInfo(
+        width=video_info.width,
+        height=video_info.height,
+        fps=sink_fps,
+        total_frames=None
+        if not total_frames
+        else max(1, total_frames // max(args.stride, 1)),
+    )
+
     print(
         f"Processing {args.source} ({video_info.width}x{video_info.height} @ {fps:.1f}fps)"
     )
@@ -402,7 +419,7 @@ def main() -> None:
     start_time = time.monotonic()
 
     try:
-        with sv.VideoSink(args.output, video_info) as sink:
+        with sv.VideoSink(args.output, sink_video_info) as sink:
             for frame_index, frame in enumerate(frame_source):
                 timestamp_sec = (frame_index * args.stride) / fps
                 pose: CameraPose | None = None
