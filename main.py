@@ -27,19 +27,72 @@ still saved.
 from __future__ import annotations
 
 import argparse
+import csv
 import time
+from dataclasses import dataclass
 from collections.abc import Callable
 from pathlib import Path
 
 import cv2
 import numpy as np
 from detector_utils import filter_by_class_names, find_new_confirmed_track_ids
+from geo import CameraPose
 from intel_log import IntelLog
 from scout_zoom import detect_with_scout
 from trackers import ByteTrackTracker
 from ultralytics import YOLO
 
 import supervision as sv
+
+
+@dataclass
+class TelemetrySample:
+    timestamp_sec: float
+    lat: float
+    lon: float
+    agl_m: float
+    heading_deg: float
+    gimbal_pitch_deg: float
+    gimbal_yaw_deg: float
+    hfov_deg: float
+
+    def to_pose(self, frame_w: int, frame_h: int) -> CameraPose:
+        return CameraPose(
+            lat=self.lat,
+            lon=self.lon,
+            agl_m=self.agl_m,
+            heading_deg=self.heading_deg,
+            gimbal_pitch_deg=self.gimbal_pitch_deg,
+            gimbal_yaw_deg=self.gimbal_yaw_deg,
+            hfov_deg=self.hfov_deg,
+            frame_w=frame_w,
+            frame_h=frame_h,
+        )
+
+
+def load_telemetry(path: str | None, default_hfov_deg: float) -> list[TelemetrySample]:
+    if not path:
+        return []
+
+    samples: list[TelemetrySample] = []
+    with Path(path).open(newline="") as file_obj:
+        reader = csv.DictReader(file_obj)
+        for row in reader:
+            samples.append(
+                TelemetrySample(
+                    timestamp_sec=float(row["timestamp_sec"]),
+                    lat=float(row["lat"]),
+                    lon=float(row["lon"]),
+                    agl_m=float(row["agl_m"]),
+                    heading_deg=float(row["heading_deg"]),
+                    gimbal_pitch_deg=float(row.get("gimbal_pitch_deg") or 0.0),
+                    gimbal_yaw_deg=float(row.get("gimbal_yaw_deg") or 0.0),
+                    hfov_deg=float(row.get("hfov_deg") or default_hfov_deg),
+                )
+            )
+
+    samples.sort(key=lambda sample: sample.timestamp_sec)
+    return samples
 
 
 def make_callback(
@@ -209,6 +262,24 @@ def parse_args() -> argparse.Namespace:
         "--intel-csv", default="intel_log.csv", help="Where to write the intel log CSV."
     )
     parser.add_argument(
+        "--telemetry",
+        help="Optional CSV with timestamp_sec, lat, lon, agl_m, heading_deg, and optional gimbal/fov columns.",
+    )
+    parser.add_argument(
+        "--hfov",
+        type=float,
+        default=70.0,
+        help="Default horizontal field of view in degrees when telemetry rows omit hfov_deg.",
+    )
+    parser.add_argument(
+        "--geojson",
+        help="Optional GeoJSON output path for pinned detections. Defaults beside the intel CSV when telemetry is provided.",
+    )
+    parser.add_argument(
+        "--gpx",
+        help="Optional GPX output path for pinned detections. Defaults beside the intel CSV when telemetry is provided.",
+    )
+    parser.add_argument(
         "--scout",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -280,6 +351,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     class_names = [c.strip() for c in args.classes.split(",") if c.strip()]
+    telemetry = load_telemetry(args.telemetry, args.hfov)
+    telemetry_index = 0
 
     print(f"Loading model: {args.model}")
     model = YOLO(args.model)
@@ -324,12 +397,25 @@ def main() -> None:
     print(
         f"Processing {args.source} ({video_info.width}x{video_info.height} @ {fps:.1f}fps)"
     )
+    if telemetry:
+        print(f"Loaded {len(telemetry)} telemetry sample(s) from {args.telemetry}")
     start_time = time.monotonic()
 
     try:
         with sv.VideoSink(args.output, video_info) as sink:
             for frame_index, frame in enumerate(frame_source):
                 timestamp_sec = (frame_index * args.stride) / fps
+                pose: CameraPose | None = None
+                if telemetry:
+                    while (
+                        telemetry_index + 1 < len(telemetry)
+                        and telemetry[telemetry_index + 1].timestamp_sec
+                        <= timestamp_sec
+                    ):
+                        telemetry_index += 1
+                    pose = telemetry[telemetry_index].to_pose(
+                        frame_w=frame.shape[1], frame_h=frame.shape[0]
+                    )
 
                 if args.scout:
                     detections, prev_gray, roi_count, used_fallback = detect_with_scout(
@@ -380,6 +466,7 @@ def main() -> None:
                         if detections.confidence is not None
                         else 0.0,
                         snapshot_path=snapshot_path,
+                        pose=pose,
                     )
                     print(
                         f"[{timestamp_sec:6.1f}s] new person spotted -> track_id={track_id}"
@@ -419,9 +506,20 @@ def main() -> None:
     finally:
         elapsed = time.monotonic() - start_time
         intel_log.save_csv(args.intel_csv)
+        if telemetry:
+            csv_path = Path(args.intel_csv)
+            geojson_path = (
+                Path(args.geojson) if args.geojson else csv_path.with_suffix(".geojson")
+            )
+            gpx_path = Path(args.gpx) if args.gpx else csv_path.with_suffix(".gpx")
+            intel_log.save_geojson(geojson_path)
+            intel_log.save_gpx(gpx_path)
         print(f"\nDone in {elapsed:.1f}s. {intel_log.summary()}")
         print(f"Annotated video saved to {args.output}")
         print(f"Intel log saved to {args.intel_csv}")
+        if telemetry:
+            print(f"GeoJSON pins saved to {geojson_path}")
+            print(f"GPX pins saved to {gpx_path}")
         if intel_log.events:
             print(f"Snapshots saved to {snapshot_dir}/")
 

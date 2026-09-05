@@ -16,7 +16,7 @@ operator: scan wide, zoom only where something lives, then confirm that it
 persists.
 
 Built on the same stack as the rest of this portfolio — `ultralytics` YOLO
-+ `supervision` — plus three pieces that are new to this project:
++ `supervision` — plus four pieces that are new to this project:
 
 - **Tiled inference** (`sv.InferenceSlicer`): drone footage is high
   resolution with tiny subjects; running YOLO on the whole frame at once
@@ -29,6 +29,10 @@ Built on the same stack as the rest of this portfolio — `ultralytics` YOLO
 - **Multi-object tracking** (`ByteTrackTracker`, from the `trackers`
   package): assigns a stable ID to each person across frames, so "new
   person spotted" fires once per person, not once per frame.
+- **Pixel-to-ground pinning** (`geo.py`): when telemetry is available, a
+  confirmed track's pixel location is raycast onto the ground to produce a
+  lat/lon with an honest error radius, turning a box into a map pin instead
+  of just a frame coordinate.
 
 ## Why this approach exists
 
@@ -155,7 +159,10 @@ problem tiled inference and fine-tuning both exist to solve:
 - `detector_utils.py` — the two pieces of logic worth unit-testing on their
   own: filtering detections down to classes you care about, and deciding
   whether a tracked ID is genuinely new.
-- `intel_log.py` — records each new-person event and exports it to CSV.
+- `scout_zoom.py` — motion-gated ROI scouting and explicit zoomed inference.
+- `geo.py` — flat-earth pixel-to-ground raycast, GSD, and error-radius math.
+- `intel_log.py` — records each new-person event and exports it to CSV, plus
+  GeoJSON/GPX when a track has a ground pin.
 - `train_colab.py` — a cell-by-cell script (paste into Google Colab) for
   fine-tuning a YOLO model on an aerial person-detection dataset, optionally
   re-tiling the training images first with `TrainingSlicer`.
@@ -192,6 +199,31 @@ Outputs:
 - `intel_log.csv` — one row per newly-spotted person.
 - `snapshots/` — one cropped image per newly-spotted person.
 
+If you also provide telemetry, every confirmed track can be projected to a
+ground pin and exported as map-ready files:
+
+```powershell
+python main.py --source drone_video.mp4 --telemetry telemetry.csv
+```
+
+Telemetry rows are matched by `timestamp_sec` and should include:
+
+```text
+timestamp_sec,lat,lon,agl_m,heading_deg,gimbal_pitch_deg,gimbal_yaw_deg,hfov_deg
+0.0,39.0901,-77.5380,180,42,8,0,70
+```
+
+When telemetry is present, the pipeline still writes the CSV but also emits:
+
+- `intel_log.geojson` — pinned detections for GIS tools such as QGIS or geojson.io
+- `intel_log.gpx` — waypoints for field tools such as Gaia or CalTopo
+
+New CSV columns are appended only when a pin can be computed:
+
+- `lat`, `lon`
+- `agl_m`, `gsd_cm`
+- `err_radius_m`
+
 ## Improving accuracy: fine-tune on aerial data
 
 A stock YOLO model was trained on ground-level photos, so it under-performs
@@ -216,6 +248,9 @@ python main.py --source drone_video.mp4 --model best.pt --classes person
 | `--scout-min-area` / `--scout-max-area` | 8 / 900 | Pixel-area band for motion blobs worth zooming into. This is the main knob for matching the scout stage to expected person size at a given altitude. |
 | `--scout-fallback-interval` | 30 | Forces an occasional full sliced pass so static or low-motion targets are not ignored forever. |
 | `--tracker-min-frames` | 3 | Minimum persistence before a target is logged as a real sighting. |
+| `--telemetry` | unset | Optional CSV with per-timestamp camera pose data for projecting detections to ground pins. |
+| `--hfov` | 70 | Default horizontal field of view used when telemetry rows omit `hfov_deg`. |
+| `--geojson` / `--gpx` | auto | Optional output paths for pinned detections; default to the intel CSV stem when telemetry is provided. |
 | `--stride` | 1 | Process every Nth frame. Raise this (e.g. `15`-`60`) on CPU to keep up with long or high-resolution footage — the tracker's `timestamp` handling keeps counts and timing correct even when frames are skipped. |
 | `--confidence` | 0.25 | Minimum detection confidence. |
 | `--device` | cpu | `cuda` or `cuda:0` if you have a GPU available locally (check with `nvidia-smi`). |
