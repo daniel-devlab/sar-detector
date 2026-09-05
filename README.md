@@ -297,3 +297,36 @@ which is slightly stricter than the old behavior and better aligned with the
 idea that tiny high-altitude detections should survive more than one match
 before they become an intel event. `main.py` only logs and draws confirmed
 tracks, and logs each one exactly once, the first frame it becomes confirmed.
+
+## Roadmap: detection is the first 20%
+
+A SAR tool becomes operationally useful when it also tells the crew where to
+go, what has already been covered, and what is worth a zoom. Pixel-to-ground
+pinning (above) is the first slice of that; the rest is not implemented yet:
+
+- **Been-there coverage map** — a ground-projected grid that only marks a
+  cell "searched" once `person_px` at that altitude clears the detection
+  floor, so a zoomed-out pass does not falsely count as covered.
+- **Lost-person search prior** — bias scout/zoom toward high-probability
+  terrain (downhill, trails, clearing edges) instead of scanning uniformly.
+- **Thermal + RGB fusion** — scout on thermal, confirm on RGB, for real
+  high-altitude and night performance.
+- **Reject memory ("not a rock")** — suppress a GPS cell and chip appearance
+  hash after an operator rejects it, and feed rejects into the next
+  fine-tune.
+- **Operator accept/reject review UI** — a keystroke-driven loop (`A`/`R`/`Z`/`N`)
+  so a human confirms every find and generates labeled data for free.
+- **Active gimbal zoom** — when a track persists but stays small, slew/zoom/
+  descend for one identifying pass, then climb back to search altitude.
+- **Revisit / change detection** — align repeat passes over the same grid and
+  highlight new compact blobs, catching people who were sitting still.
+- **Secondary SAR object classes** — tent/tarp, backpack, vehicle, high-vis
+  clothing, and water/trail corridors as search context, not just "person."
+- **Track-through-canopy ghosting** — keep a predicted position for a lost
+  track for a few seconds so re-acquisition reuses the same ID.
+- **Honest confidence recalibration** — scale reported confidence by target
+  size and track age so the operator isn't chasing single-frame noise.
+- **SITREP export** — a one-page PDF/ATAK-style summary on top of the
+  existing CSV/GeoJSON/GPX exports.
+- **Synthetic tiny-people training data** — paste tiny-person cutouts onto
+  real terrain frames to train on the 4-25px scale this footage actually has.
